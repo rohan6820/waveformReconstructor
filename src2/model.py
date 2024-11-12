@@ -740,56 +740,60 @@ class Encode_Decode_Integrator(nn.Module):
             self.layers.append(layer)
 
         # build decoder layers
-        self.layers_up = nn.ModuleList()
-        self.concat_back_dim = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            concat_linear = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
-                                      int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
-            if i_layer == 0:
-                # import pdb
-                # pdb.set_trace()
-                # # Ansh Modify starts
-                # layer_up = PatchExpand(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
-                #                                          patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
-                layer_up = PatchExpand(input_resolution=(1,
-                                                         patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
-                # #Ansh modify Ends
-            else:
-                layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
-                                         # #Ansh Modify starts
-                                         # input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
-                                         input_resolution=(1,
-                                         # Ansh Modify ends
-                                                           patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
-                                         depth=depths[(self.num_layers-1-i_layer)],
-                                         num_heads=num_heads[(self.num_layers-1-i_layer)],
-                                         window_size=window_size,
-                                         mlp_ratio=self.mlp_ratio,
-                                         qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                         drop=drop_rate, attn_drop=attn_drop_rate,
-                                         drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
-                                         norm_layer=norm_layer,
-                                         upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
-                                         use_checkpoint=use_checkpoint)
-            self.layers_up.append(layer_up)
-            self.concat_back_dim.append(concat_linear)
+        # self.layers_up = nn.ModuleList()
+        # self.concat_back_dim = nn.ModuleList()
+        # for i_layer in range(self.num_layers):
+        #     concat_linear = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
+        #                               int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
+        #     if i_layer == 0:
+        #         # import pdb
+        #         # pdb.set_trace()
+        #         # # Ansh Modify starts
+        #         # layer_up = PatchExpand(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+        #         #                                          patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
+        #         layer_up = PatchExpand(input_resolution=(1,
+        #                                                  patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
+        #         # #Ansh modify Ends
+        #     else:
+        #         layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
+        #                                  # #Ansh Modify starts
+        #                                  # input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+        #                                  input_resolution=(1,
+        #                                  # Ansh Modify ends
+        #                                                    patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
+        #                                  depth=depths[(self.num_layers-1-i_layer)],
+        #                                  num_heads=num_heads[(self.num_layers-1-i_layer)],
+        #                                  window_size=window_size,
+        #                                  mlp_ratio=self.mlp_ratio,
+        #                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
+        #                                  drop=drop_rate, attn_drop=attn_drop_rate,
+        #                                  drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
+        #                                  norm_layer=norm_layer,
+        #                                  upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+        #                                  use_checkpoint=use_checkpoint)
+        #     self.layers_up.append(layer_up)
+        #     self.concat_back_dim.append(concat_linear)
 
-        self.norm = norm_layer(self.num_features)
-        self.norm_up= norm_layer(self.embed_dim)
-        # import pdb
-        # pdb.set_trace()
+        # self.norm = norm_layer(self.num_features)
+        # self.norm_up= norm_layer(self.embed_dim)
+        # # import pdb
+        # # pdb.set_trace()
 
-        if self.final_upsample == "expand_first":
-            print("---final upsample expand_first---")
-            # #Ansh Modify Begins
-            # self.up = FinalPatchExpand_X4(input_resolution=(img_size//patch_size,img_size//patch_size),dim_scale=4,dim=embed_dim)
-            # self.output = nn.Conv2d(in_channels=embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
-            self.up = FinalPatchExpand_X4(input_resolution=(1 ,img_size//patch_size),dim_scale=4,dim=embed_dim)
+        # if self.final_upsample == "expand_first":
+        #     print("---final upsample expand_first---")
+        #     # #Ansh Modify Begins
+        #     # self.up = FinalPatchExpand_X4(input_resolution=(img_size//patch_size,img_size//patch_size),dim_scale=4,dim=embed_dim)
+        #     # self.output = nn.Conv2d(in_channels=embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
+        #     self.up = FinalPatchExpand_X4(input_resolution=(1 ,img_size//patch_size),dim_scale=4,dim=embed_dim)
 
-            self.output = nn.Linear(embed_dim, 1)
-            # # Ansh Modify Ends
+        #     self.output = nn.Linear(embed_dim, 1)
+        #     # # Ansh Modify Ends
 
-        self.apply(self._init_weights)
+        # self.apply(self._init_weights)
+        self.hidden_mlp = Mlp(in_features=self.num_features, hidden_features=self.num_features // 2, out_features=self.num_features // 2, act_layer=nn.GELU, drop=0.)
+        self.output_mlp = Mlp(in_features=self.num_features // 2, hidden_features=self.num_features // 4, out_features=self.num_classes, act_layer=nn.GELU, drop=0.)
+        
+
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -832,8 +836,10 @@ class Encode_Decode_Integrator(nn.Module):
             x = self.layers[layerNo](x)
 
         x = self.norm(x)  # B L C
+        x = self.hidden_mlp(x)
+        x = self.output_mlp(x)
 
-        return x, x_downsample
+        return x, None
 
     #Dencoder and Skip connection
     def forward_up_features(self, x, x_downsample):
