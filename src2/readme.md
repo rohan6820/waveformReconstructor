@@ -27,11 +27,4 @@ To adapt Xi-Net for ECG classification, the architecture has been reconfigured a
 - **Feature Fusion Strategy**: Time and frequency features are concatenated before passing through dense layers.
 - **MLP Section**: A multilayer perceptron (MLP) with dropout and activation layers refines features to improve classification accuracy.
 
-## Installation
 
-To set up the environment for this project, follow these steps:
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/yourrepository.git
-   cd yourrepository
