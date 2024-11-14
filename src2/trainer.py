@@ -41,12 +41,12 @@ CONFIG = {
             "NUM_HEADS": [3, 6, 12, 24],
             "WINDOW_SIZE": 8,
             "PATCH_SIZE": 120,
-            "IN_CHANS": 1,
+            "IN_CHANS": 2,  # Modify to 2 if using both leads as channels
             "IMG_SIZE": 224,
         },
     },
     "DATA": {
-        "IMG_SIZE": 224,
+        "IMG_SIZE": 224,  # Ensure this matches model input dimensions
     }
 }
 
@@ -88,12 +88,13 @@ def denoise_signal(data, wavelet='sym4', threshold=0.04):
 # Dataset class for arrhythmia data
 
 class ArrhythmiaDataset(Dataset):
-    def __init__(self, data_path, window_size=224, denoise=True, augment=True, primary_leads=None):
+    def __init__(self, data_path, window_size=224, denoise=True, augment=True, primary_leads=None, use_two_channels=True):
         self.data_path = data_path
         self.window_size = window_size
         self.denoise = denoise
         self.augment = augment
         self.primary_leads = primary_leads if primary_leads is not None else ['MLII', 'V5']
+        self.use_two_channels = use_two_channels  # Flag to choose between single or two channels
         
         # Collect record names by finding .dat files
         self.record_files = [f.split('.')[0] for f in os.listdir(data_path) if f.endswith('.dat')]
@@ -118,11 +119,9 @@ class ArrhythmiaDataset(Dataset):
             else:
                 print(f"Lead {lead} not found in record {record_name}. Using available leads instead.")
         
-        # If specified leads are missing, use the first two available leads as a fallback
         if not lead_data:
             lead_data = {leads[0]: record.p_signal[:, 0], leads[1]: record.p_signal[:, 1]}
         
-        # Convert to a fixed two-lead structure, filling missing leads with zeros if necessary
         lead_signals = []
         for lead in self.primary_leads:
             if lead in lead_data:
@@ -130,22 +129,23 @@ class ArrhythmiaDataset(Dataset):
             else:
                 lead_signals.append(np.zeros(record.p_signal.shape[0]))
 
-        # Extract a specific window of data for each lead
         start_idx = window_idx * self.window_size
         end_idx = start_idx + self.window_size
         windowed_data = [signal[start_idx:end_idx] for signal in lead_signals]
 
-        # Apply denoising if specified
         if self.denoise:
             windowed_data = [denoise_signal(signal) for signal in windowed_data]
 
-        # Pad each window to 224 samples
-        windowed_data = [F.pad(torch.tensor(signal).float(), (0, 224 - len(signal)), "constant", 0) for signal in windowed_data]
+        # Ensure each window has exactly 224 samples (pad or truncate)
+        windowed_data = [torch.tensor(signal).float()[:224] for signal in windowed_data]
+        windowed_data = [F.pad(signal, (0, 224 - len(signal)), "constant", 0) for signal in windowed_data]
         
-        # Stack leads and duplicate to form a 224x224 grid
-        input_data = torch.stack(windowed_data).unsqueeze(0).expand(1, 224, 224)
-        
-        # Placeholder target data: Using same data as target for now
+        # Stack leads to create a 2x224x224 tensor if using two channels, otherwise a 1x224x224
+        if self.use_two_channels:
+            input_data = torch.stack(windowed_data).view(2, 224, 224)
+        else:
+            input_data = torch.stack(windowed_data).mean(dim=0).view(1, 224, 224)
+
         target_data = input_data.clone()
         
         return input_data, target_data
@@ -183,12 +183,12 @@ if __name__ == "__main__":
         'swin_tiny_patch4_window7_224',
         pretrained=True,
         num_classes=CONFIG["MODEL"]["SWIN"].get("NUM_CLASSES", 1000),
-        in_chans=CONFIG["MODEL"]["SWIN"]["IN_CHANS"],
+        in_chans=2 if CONFIG["MODEL"]["SWIN"]["IN_CHANS"] == 2 else 1,  # Set in_chans to 2 if using both leads
         img_size=(CONFIG["MODEL"]["SWIN"]["IMG_SIZE"], CONFIG["MODEL"]["SWIN"]["IMG_SIZE"])
     ).cuda()
 
-    trainContainer = ArrhythmiaDataset(DATAPATH, window_size=224, denoise=True, augment=True)
-    testContainer = ArrhythmiaDataset(DATAPATH, window_size=224, denoise=True, augment=False)
+    trainContainer = ArrhythmiaDataset(DATAPATH, window_size=224, denoise=True, augment=True, use_two_channels=(CONFIG["MODEL"]["SWIN"]["IN_CHANS"] == 2))
+    testContainer = ArrhythmiaDataset(DATAPATH, window_size=224, denoise=True, augment=False, use_two_channels=(CONFIG["MODEL"]["SWIN"]["IN_CHANS"] == 2))
     trainGenerator = DataLoader(trainContainer, batch_size=allArgs.batch_size, shuffle=True, num_workers=NUM_WORKERS)
     testGenerator = DataLoader(testContainer, batch_size=allArgs.batch_size, shuffle=True, num_workers=NUM_WORKERS)
 
@@ -202,14 +202,22 @@ if __name__ == "__main__":
         eStart = time.time()
         lossVecB = []
         for batchIdx, (img, label) in enumerate(trainGenerator):
+            print("Shape of img before reshaping:", img.shape)  # Debugging shape
             img = img.cuda().float()
-            img = img.reshape(BATCH_SIZE, 1, 224, 224)
+
+            # Reshape and expand to match model input if needed
+            if img.shape[1:] == (2, 224, 224) or img.shape[1:] == (1, 224, 224):
+                img = img.view(BATCH_SIZE, *img.shape[1:])
+            else:
+                raise ValueError(f"Unexpected shape for img: {img.shape}, cannot reshape")
+
             op = model(img)
             loss = computeLoss(lossObj, op, label)
-            lossVecB.append(loss.mean())
+            lossVecB.append(loss.mean().item())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        
         eEnd = time.time()
         lossEMean = sum(lossVecB) / float(len(lossVecB))
         print("Epoch Time {}: {} [Loss: {}]".format(epochNum + 1, eEnd - eStart, lossEMean))
