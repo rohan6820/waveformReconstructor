@@ -1,54 +1,35 @@
+import csv
 import os
+import pandas as pd
 import sys
 import time
 import logging
+import random
 import argparse
 import torch
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
-import timm  # Import timm for pretrained model
-import robust_loss_pytorch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from tensorboardX import SummaryWriter
-from torch.nn.modules.loss import CrossEntropyLoss, MSELoss
+from torch.utils.data import DataLoader
+from torch.nn.modules.loss import MultiLabelSoftMarginLoss
 import pywt
-from scipy import stats
+from robust_loss_pytorch import AdaptiveLossFunction
+import re
 import wfdb
 import torch.nn.functional as F
-
+from torch.utils.data import Dataset
+from collections import Counter
 from defaultConfig import get_config
 from model import WaveformReconstructor
 import torch.nn as nn
+from robust_loss_pytorch import AdaptiveLossFunction
+from torch.utils.data import WeightedRandomSampler
 
+# Constants
 BATCH_SIZE = 4
 NUM_WORKERS = 0
-DATAPATH = r"E:\Work\Classes\Sem3\IntSys\WFC\waveformReconstructor\src2\mit-bih-arrhythmia-database-1.0.0"
+DATAPATH = "E:\Work\\Classes\Sem3\\IntSys\WFC\waveformReconstructor\src2\\"
 assert os.path.exists(DATAPATH), "Dataset path invalid: {}".format(DATAPATH)
-
-# Configuration setup
-CONFIG = {
-    "MODEL": {
-        "TYPE": "swin",
-        "NAME": "swin_tiny_patch4_window7_224",
-        "DROP_PATH_RATE": 0.2,
-        "SWIN": {
-            "FINAL_UPSAMPLE": "expand_first",
-            "EMBED_DIM": 96,
-            "DEPTHS": [2, 2, 2, 2],
-            "DECODER_DEPTHS": [2, 2, 2, 1],
-            "NUM_HEADS": [3, 6, 12, 24],
-            "WINDOW_SIZE": 8,
-            "PATCH_SIZE": 120,
-            "IN_CHANS": 2,  # Modify to 2 if using both leads as channels
-            "IMG_SIZE": 224,
-        },
-    },
-    "DATA": {
-        "IMG_SIZE": 224,  # Ensure this matches model input dimensions
-    }
-}
 
 # Setup logger
 def setupLogger():
@@ -64,14 +45,12 @@ def setupLogger():
 # Argument loader
 def loadArguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--max_epochs', type=int, default=150, help='maximum epoch number to train')
+    parser.add_argument('--max_epochs', type=int, default=100, help='maximum epoch number to train')
     parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
     parser.add_argument('--base_lr', type=float, default=0.01, help='learning rate')
-    parser.add_argument('--lossName', default="mse", choices=["mse", "adaptive"], help='Loss function name')
+    parser.add_argument('--lossName', default="MultiLabelSoftMarginLoss", choices=["MultiLabelSoftMarginLoss", "adaptive"], help='Loss function name')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    
-    allArgs = parser.parse_args()
-    return allArgs
+    return parser.parse_args()
 
 # Signal denoising function
 def denoise_signal(data, wavelet='sym4', threshold=0.04):
@@ -87,142 +66,245 @@ def denoise_signal(data, wavelet='sym4', threshold=0.04):
 
 # Dataset class for arrhythmia data
 
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
 class ArrhythmiaDataset(Dataset):
-    def __init__(self, data_path, window_size=224, denoise=True, augment=True, primary_leads=None, use_two_channels=True):
-        self.data_path = data_path
+    def __init__(self, npz_folder=".", window_size=9600):
+        """
+        Initialize the dataset with preprocessed .npz files.
+        :param npz_folder: Path to the folder containing .npz files. Defaults to the current directory.
+        :param window_size: Fixed size of the signal window (default: 9600).
+        """
         self.window_size = window_size
-        self.denoise = denoise
-        self.augment = augment
-        self.primary_leads = primary_leads if primary_leads is not None else ['MLII', 'V5']
-        self.use_two_channels = use_two_channels  # Flag to choose between single or two channels
-        
-        # Collect record names by finding .dat files
-        self.record_files = [f.split('.')[0] for f in os.listdir(data_path) if f.endswith('.dat')]
+        self.label_map = {"N": 0, "L": 1, "R": 2, "V": 3}
+        self.npz_folder = os.path.abspath(npz_folder)  # Convert to absolute path
+        self.npz_files = [os.path.join(self.npz_folder, f) for f in os.listdir(self.npz_folder) if f.endswith('.npz')]
+        # import pdb
+        # pdb.set_trace()
+        # Check if .npz files exist
+        if not self.npz_files:
+            raise FileNotFoundError(f"No .npz files found in the directory: {self.npz_folder}")
+
+        self.data = []  # Will store all (signal_channel_1, signal_channel_2, label) tuples
+        self.load_data()
+        random.shuffle(self.data)
+
+        # Check if dataset has been populated
+        if len(self.data) == 0:
+            raise ValueError(f"No data loaded from .npz files in {self.npz_folder}. Ensure files are not empty or corrupted.")
+
+    def load_data(self):
+        """
+        Load all signal segments and labels from the .npz files during initialization.
+        """
+
+        for npz_file in self.npz_files:
+            # baseFileName = os.path.basename(npz_file)
+            match = re.search("data_(?P<labelName>\w)\.npz", npz_file)
+            assert match, "match not found"
+            label = self.label_map[match.group("labelName")]
+            npz_data = np.load(npz_file, allow_pickle=True)
+
+            for idx in range(5500):
+                key = "arr_{}".format(idx)
+                if key in npz_data:
+                    try:
+                        npz_data[key].reshape(2,9600)
+                    except:
+                        pass
+                    self.data.append([npz_data[key], label])
 
     def __len__(self):
-        return len(self.record_files) * (65000 // self.window_size) if self.record_files else 0
+        """
+        Returns the total number of samples in the dataset.
+        """
+        return len(self.data)
 
     def __getitem__(self, idx):
-        record_idx = idx // (65000 // self.window_size)
-        window_idx = idx % (65000 // self.window_size)
-
-        record_name = self.record_files[record_idx]
-        record_path = os.path.join(self.data_path, record_name)
-        record = wfdb.rdrecord(record_path)
-
-        leads = record.sig_name
-        lead_data = {}
+        """
+        Returns a single sample (signals and label) at the given index.
+        :param idx: Index of the sample.
+        :return: A tuple (signal_tensor, label_tensor).
+        """
+        signal, label = self.data[idx]
         
-        for lead in self.primary_leads:
-            if lead in leads:
-                lead_data[lead] = record.p_signal[:, leads.index(lead)]
-            else:
-                print(f"Lead {lead} not found in record {record_name}. Using available leads instead.")
-        
-        if not lead_data:
-            lead_data = {leads[0]: record.p_signal[:, 0], leads[1]: record.p_signal[:, 1]}
-        
-        lead_signals = []
-        for lead in self.primary_leads:
-            if lead in lead_data:
-                lead_signals.append(lead_data[lead])
-            else:
-                lead_signals.append(np.zeros(record.p_signal.shape[0]))
+        # Convert signals to PyTorch tensors
+        signal_tensor = torch.tensor(signal, dtype=torch.float32)
+        signal_tensor = (signal_tensor - signal_tensor.min()) / (signal_tensor.max() - signal_tensor.min())
 
-        start_idx = window_idx * self.window_size
-        end_idx = start_idx + self.window_size
-        windowed_data = [signal[start_idx:end_idx] for signal in lead_signals]
+            # Convert label to a PyTorch tensor
+        label_tensor = torch.tensor(label, dtype=torch.float32)
+        try:
+            signal_tensor.reshape(2,1,9600)
+        except:
+            # import pdb
+            # pdb.set_trace()
+            pad = torch.zeros(2, 1)
+            signal_tensor = torch.cat((signal_tensor, pad), dim=1)
+        return signal_tensor.reshape(2,1,9600), label_tensor
+    
+def getloss(op, label, num_classes=4, reduction='mean'):
+    """
+    Compute the MultiLabelSoftMarginLoss for multi-class classification.
 
-        if self.denoise:
-            windowed_data = [denoise_signal(signal) for signal in windowed_data]
+    :param op: Model output (logits), shape [batch_size, num_classes].
+    :param label: Target labels, scalar [batch_size] or one-hot encoded [batch_size, num_classes].
+    :param num_classes: Number of classes (default = 4).
+    :param reduction: Specifies the reduction to apply: 'none' | 'mean' | 'sum'.
+    :return: Scalar loss value.
+    """
+    loss_fn = nn.MultiLabelSoftMarginLoss(reduction=reduction)
 
-        # Ensure each window has exactly 224 samples (pad or truncate)
-        windowed_data = [torch.tensor(signal).float()[:224] for signal in windowed_data]
-        windowed_data = [F.pad(signal, (0, 224 - len(signal)), "constant", 0) for signal in windowed_data]
-        
-        # Stack leads to create a 2x224x224 tensor if using two channels, otherwise a 1x224x224
-        if self.use_two_channels:
-            input_data = torch.stack(windowed_data).view(2, 224, 224)
-        else:
-            input_data = torch.stack(windowed_data).mean(dim=0).view(1, 224, 224)
+    # Handle scalar labels (convert to multi-hot encoding)
+    if label.dim() == 1:
+        batch_size = label.size(0)
+        # Create a multi-hot label tensor
+        multi_hot_label = torch.zeros((batch_size, num_classes), device=label.device)
+        multi_hot_label.scatter_(1, label.unsqueeze(1).long(), 1)
+        label = multi_hot_label
 
-        target_data = input_data.clone()
-        
-        return input_data, target_data
+    # Handle already one-hot encoded labels
+    elif label.dim() == 2:
+        label = label.float()
 
-# Loss function selection
-def getLoss(lossName="mse"):
-    assert lossName in ["mse", "adaptive"]
-    if lossName == "mse":
-        return MSELoss()
-    if lossName == "adaptive":
-        return robust_loss_pytorch.adaptive.AdaptiveLossFunction(num_dims=14400, float_dtype=np.float32, device=0)
-    raise Exception("INVALID SOFTWARE FLOW")
+    else:
+        raise ValueError(f"Unexpected label dimensions: {label.dim()}. Expected 1 or 2.")
 
-# Loss computation
-def computeLoss(lossObj, test, ref):
-    B, _ = test.shape
-    refList = []
-    testList = []
-    for i in range(B):
-        refVal = ref['original'][i][ref['gapStartIdx'][i] : ref['gapEndIdx'][i]]
-        testVal = test[i][ref['gapStartIdx'][i] : ref['gapEndIdx'][i]]
-        refList.append(refVal)
-        testList.append(testVal)
-    finalRef = torch.stack(refList)
-    finalTest = torch.stack(testList)
-    loss = lossObj(finalTest, finalRef.cuda().float())
+    # Ensure logits (op) are float
+    op = op.float()
+
+    # Check for shape mismatches
+    if op.shape != label.shape:
+        raise ValueError(f"Shape mismatch: op shape {op.shape}, label shape {label.shape}")
+
+    # Compute loss
+    loss = loss_fn(op, label)
     return loss
+
 
 # Main training script
 if __name__ == "__main__":
     setupLogger()
     allArgs = loadArguments()
     
-    model = timm.create_model(
-        'swin_tiny_patch4_window7_224',
-        pretrained=True,
-        num_classes=CONFIG["MODEL"]["SWIN"].get("NUM_CLASSES", 1000),
-        in_chans=2 if CONFIG["MODEL"]["SWIN"]["IN_CHANS"] == 2 else 1,  # Set in_chans to 2 if using both leads
-        img_size=(CONFIG["MODEL"]["SWIN"]["IMG_SIZE"], CONFIG["MODEL"]["SWIN"]["IMG_SIZE"])
-    ).cuda()
+    # Create a namespace with all the expected attributes for get_config
+    args = argparse.Namespace(
+        cfg="modifyConfig.yaml",
+        opts=[],
+        batch_size=allArgs.batch_size,
+        max_epochs=allArgs.max_epochs,
+        base_lr=allArgs.base_lr,
+        zip=False,
+        cache_mode='part',
+        resume='',
+        accumulation_steps=1,
+        use_checkpoint=False,
+        amp_opt_level='O1',
+        tag='experiment',
+        eval=allArgs.eval,
+        throughput=False,
+        pretrained=False,
+        output='',
+        local_rank=0,
+        seed=42,
+        print_freq=10,
+        save_ckpt_freq=10
+    )
+    
+    config = get_config(args)
 
-    trainContainer = ArrhythmiaDataset(DATAPATH, window_size=224, denoise=True, augment=True, use_two_channels=(CONFIG["MODEL"]["SWIN"]["IN_CHANS"] == 2))
-    testContainer = ArrhythmiaDataset(DATAPATH, window_size=224, denoise=True, augment=False, use_two_channels=(CONFIG["MODEL"]["SWIN"]["IN_CHANS"] == 2))
-    trainGenerator = DataLoader(trainContainer, batch_size=allArgs.batch_size, shuffle=True, num_workers=NUM_WORKERS)
-    testGenerator = DataLoader(testContainer, batch_size=allArgs.batch_size, shuffle=True, num_workers=NUM_WORKERS)
+    model = WaveformReconstructor(config).cuda()
+   
+    # Create Dataset containers
+    trainContainer = ArrhythmiaDataset(DATAPATH, window_size=9600)
+    testContainer = ArrhythmiaDataset(DATAPATH, window_size=9600)
 
+    # Option 1: Use a weighted sampler
+    trainGenerator = DataLoader(trainContainer, batch_size=allArgs.batch_size, num_workers=NUM_WORKERS)
+
+    # Option 2: Oversample the dataset (comment out if using the sampler)
+    # oversampled_data = trainContainer.oversample_dataset(trainContainer, train_class_counts)
+    # trainGenerator = DataLoader(oversampled_data, batch_size=allArgs.batch_size, shuffle=True, num_workers=NUM_WORKERS)
+
+    # Test DataLoader
+    testGenerator = DataLoader(testContainer, batch_size=allArgs.batch_size, shuffle=False, num_workers=NUM_WORKERS)
+#    model.load_state_dict(torch.load("bestModel.pt"))
     model.train()
-    lossObj = getLoss(lossName=allArgs.lossName)
-    optimizer = optim.AdamW(model.parameters(), lr=allArgs.base_lr, weight_decay=0.0001)
+   # lossObj = getloss()
+    optimizer = optim.AdamW(model.parameters(), lr=allArgs.base_lr, weight_decay=0.01)
     max_epoch = allArgs.max_epochs
     lossVecE = []
 
-    for epochNum in range(max_epoch):
-        eStart = time.time()
-        lossVecB = []
-        for batchIdx, (img, label) in enumerate(trainGenerator):
-            print("Shape of img before reshaping:", img.shape)  # Debugging shape
-            img = img.cuda().float()
+best_accuracy = 0  # Initialize the best accuracy
+best_epoch = -1  # Initialize the best epoch number
 
-            # Reshape and expand to match model input if needed
-            if img.shape[1:] == (2, 224, 224) or img.shape[1:] == (1, 224, 224):
-                img = img.view(BATCH_SIZE, *img.shape[1:])
-            else:
-                raise ValueError(f"Unexpected shape for img: {img.shape}, cannot reshape")
+# Training Loop
+best_accuracy = 0  # Initialize the best accuracy
+best_epoch = -1  # Initialize the best epoch number
 
+for epochNum in range(max_epoch):
+    eStart = time.time()
+    lossVecB = []  # To store batch losses
+    correct = 0    # To count correct predictions
+    total = 0      # To count total labels processed
+
+    print(f"Starting Epoch {epochNum + 1}...")
+
+    for batchIdx, (img, label) in enumerate(trainGenerator):
+        try:
+            # Move data to GPU
+            img, label = img.cuda().float(), label.cuda()
+
+            # Forward pass
             op = model(img)
-            loss = computeLoss(lossObj, op, label)
-            lossVecB.append(loss.mean().item())
+
+            # Compute predictions
+            predictions = (torch.sigmoid(op) > 0.5).float()
+
+            # Compute loss
+            loss = getloss(op, label)
+            lossVecB.append(loss.item())
+
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
-        
-        eEnd = time.time()
-        lossEMean = sum(lossVecB) / float(len(lossVecB))
-        print("Epoch Time {}: {} [Loss: {}]".format(epochNum + 1, eEnd - eStart, lossEMean))
-        lossVecE.append(lossEMean)
-        torch.save(model.state_dict(), "trainedModel.pt")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-    torch.save(model.state_dict(), "trainedModel.pt")
-    print("Training complete")
+            optimizer.step()
+
+
+            # Accuracy calculation
+            correct_labels = (predictions == label).sum().item()
+            total_labels = predictions.numel()  # Total number of labels in the batch
+            correct += correct_labels
+            total += total_labels
+
+        except Exception as e:
+            print(f"Error in batch {batchIdx}: {e}")
+            # Debugging: Inspect the problematic batch
+          ##   print(f"Label shape: {label.shape if 'label' in locals() else 'N/A'}")
+            continue  # Skip the problematic batch
+
+    # Calculate epoch metrics
+    eEnd = time.time()
+    lossEMean = sum(lossVecB) / len(lossVecB) if len(lossVecB) > 0 else float('inf')
+    accuracy = (correct / total) * 100 if total > 0 else 0  # Avoid division by zero
+
+    print(f"Epoch {epochNum + 1}: Time = {eEnd - eStart:.2f}s, Loss = {lossEMean:.4f}, Accuracy = {accuracy:.2f}%")
+
+    # Save the model for the current epoch
+    torch.save(model.state_dict(), f"epoch{epochNum}.pt")
+
+    # Update the best model
+    if accuracy > best_accuracy:
+        best_accuracy = accuracy
+        best_epoch = epochNum
+        torch.save(model.state_dict(), "bestModel.pt")  # Save the best model
+
+# After training, print the best accuracy and epoch
+print(f"Training complete. Best Accuracy: {best_accuracy:.2f}% at Epoch {best_epoch + 1}")
+
