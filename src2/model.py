@@ -20,16 +20,15 @@ import torch.nn as nn
 import numpy as np
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
+from torch.nn import BCEWithLogitsLoss
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
 
-import torch
-import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-
+# Define helper functions for window partitioning and reversing
 def window_partition(x, window_size):
     """
     Args:
@@ -60,8 +59,9 @@ def window_reverse(windows, window_size, H, W):
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
+# Define the MLP class
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.1):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -69,6 +69,8 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
+        self.softmax = nn.Softmax(dim=-1)  # For multi-class classification
+
 
     def forward(self, x):
         x = self.fc1(x)
@@ -76,8 +78,10 @@ class Mlp(nn.Module):
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
+        x = self.softmax(x)  # Ensure output probabilities
         return x
 
+# Define the WindowAttention class
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
@@ -92,7 +96,7 @@ class WindowAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0.1, proj_drop=0.1):
 
         super().__init__()
         self.dim = dim
@@ -175,12 +179,13 @@ class WindowAttention(nn.Module):
         flops += N * self.dim * self.dim
         return flops
 
+# Define the SwinTransformerBlock class
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
 
     Args:
         dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
+        input_resolution (tuple[int]): Input resolution.
         num_heads (int): Number of attention heads.
         window_size (int): Window size.
         shift_size (int): Shift size for SW-MSA.
@@ -195,7 +200,7 @@ class SwinTransformerBlock(nn.Module):
     """
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0.1, attn_drop=0.1, drop_path=0.1,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
@@ -224,15 +229,9 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         if self.shift_size > 0:
-            # import pdb
-            # pdb.set_trace()
             # calculate attention mask for SW-MSA
             H, W = self.input_resolution
             # # Ansh Modify Begins
-            # img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            # h_slices = (slice(0, -self.window_size),
-            #             slice(-self.window_size, -self.shift_size),
-            #             slice(-self.shift_size, None))
             img_mask = torch.zeros((1, 1, W, 1))  # 1 1 W 1
             # # Ansh modify Ends
             w_slices = (slice(0, -self.window_size),
@@ -240,10 +239,6 @@ class SwinTransformerBlock(nn.Module):
                         slice(-self.shift_size, None))
             cnt = 0
             # #Ansh Modify Begins
-            # for h in h_slices:
-            #     for w in w_slices:
-            #         img_mask[:, h, w, :] = cnt
-            #         cnt += 1
             for w in w_slices:
                 img_mask[:, 0, w, :] = cnt
                 cnt += 1
@@ -259,14 +254,14 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x):
-        # import pdb
-        # pdb.set_trace()
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size: swin transformer block: {}={}x{}".format(L, H, W)
-
+        # print(f"Before norm1 in SwineTransformerBlock: {x.shape}")  # Debug print
         shortcut = x
         x = self.norm1(x)
+        # print(f"After norm1 in SwineTransformerBlock: {x.shape}")  # Debug print
+
         x = x.view(B, H, W, C)
 
         # cyclic shift
@@ -317,6 +312,7 @@ class SwinTransformerBlock(nn.Module):
         flops += self.dim * H * W
         return flops
 
+# Define the PatchMerging class
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
 
@@ -341,9 +337,6 @@ class PatchMerging(nn.Module):
         """
         x: B, H*W, C
         """
-        # import pdb
-        # pdb.set_trace()
-        ## Start from here next
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size: Patch Merging"
@@ -364,21 +357,12 @@ class PatchMerging(nn.Module):
         x0 = x[:, 0, 0::2, :]  # B 1 W/2 C
         x1 = x[:, 0, 1::2, :]  # B 1 W/2 C
         if x0.shape != x1.shape:
-            # import pdb
-            # pdb.set_trace()
             # Input res was odd. appending 1 dimension from x0
-            # dummyVec = x0[:, -1, :]
-            # da, db = dummyVec.shape
-            # dummyVec = dummyVec.reshape(da, 1, db)
-            # x1 = torch.cat([x1, dummyVec], dim=1)
             x0 = x0[:, :-1, :]
-
         # # Ansh Modify ends
         x = torch.cat([x0, x1], -1)  # B 1 W/2 2*C
         x = x.view(B, -1, 2 * C)  # B 1*W/2 2*C
 
-        # import pdb
-        # pdb.set_trace()
         x = self.norm(x)
         x = self.reduction(x)
 
@@ -393,6 +377,7 @@ class PatchMerging(nn.Module):
         flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
         return flops
 
+# Define the PatchExpand class
 class PatchExpand(nn.Module):
     def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -408,9 +393,6 @@ class PatchExpand(nn.Module):
         """
         x: B, H*W, C
         """
-        # print("HIT")
-        # import pdb
-        # pdb.set_trace()
         H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
@@ -423,10 +405,11 @@ class PatchExpand(nn.Module):
         x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=1, p2=2, c=C//2)
         x = x.view(B,-1,C//2)
         # Ansh modify ends
-        x= self.norm(x)
+        x = self.norm(x)
 
         return x
 
+# Define the FinalPatchExpand_X4 class
 class FinalPatchExpand_X4(nn.Module):
     def __init__(self, input_resolution, dim, dim_scale=4, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -444,8 +427,6 @@ class FinalPatchExpand_X4(nn.Module):
         """
         x: B, H*W, C
         """
-        # import pdb
-        # pdb.set_trace()
         H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
@@ -458,10 +439,11 @@ class FinalPatchExpand_X4(nn.Module):
         # Ansh modify ends reverted
 
         x = x.view(B,-1,self.output_dim)
-        x= self.norm(x)
+        x = self.norm(x)
 
         return x
 
+# Define the BasicLayer class
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
 
@@ -483,8 +465,8 @@ class BasicLayer(nn.Module):
     """
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0.1, attn_drop=0.1,
+                 drop_path=0.1, norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
@@ -535,6 +517,7 @@ class BasicLayer(nn.Module):
             flops += self.downsample.flops()
         return flops
 
+# Define the BasicLayer_up class
 class BasicLayer_up(nn.Module):
     """ A basic Swin Transformer layer for one stage.
 
@@ -551,13 +534,13 @@ class BasicLayer_up(nn.Module):
         attn_drop (float, optional): Attention dropout rate. Default: 0.0
         drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
         norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        upsample (nn.Module | None, optional): Upsample layer at the end of the layer. Default: None
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
+                 mlp_ratio=4.0, qkv_bias=True, qk_scale=None, drop=0.1, attn_drop=0.1,
+                 drop_path=0.1, norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
@@ -577,7 +560,7 @@ class BasicLayer_up(nn.Module):
                                  norm_layer=norm_layer)
             for i in range(depth)])
 
-        # patch merging layer
+        # patch expanding layer
         if upsample is not None:
             self.upsample = PatchExpand(input_resolution, dim=dim, dim_scale=2, norm_layer=norm_layer)
         else:
@@ -593,6 +576,7 @@ class BasicLayer_up(nn.Module):
             x = self.upsample(x)
         return x
 
+# Define the PatchEmbed class
 class PatchEmbed(nn.Module):
     r""" Image to Patch Embedding
 
@@ -632,8 +616,15 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         # import pdb
         # pdb.set_trace()
-        B, C, H, W = x.shape
+        try:
+            B, C, H, W = x.shape
+        except:
+            import pdb
+            pdb.set_trace()
+            pass
         # FIXME look at relaxing size constraints
+        # import pdb
+        # pdb.set_trace()
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
@@ -648,7 +639,7 @@ class PatchEmbed(nn.Module):
             flops += Ho * Wo * self.embed_dim
         return flops
 
-
+# Define the Encode_Decode_Integrator class
 class Encode_Decode_Integrator(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -664,7 +655,7 @@ class Encode_Decode_Integrator(nn.Module):
         num_heads (tuple(int)): Number of attention heads in different layers.
         window_size (int): Window size. Default: 7
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qkv_bias (bool): If True, add absolute position embedding to the patch embedding. Default: False
         qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
         drop_rate (float): Dropout rate. Default: 0
         attn_drop_rate (float): Attention dropout rate. Default: 0
@@ -682,11 +673,10 @@ class Encode_Decode_Integrator(nn.Module):
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
                  use_checkpoint=False, final_upsample="expand_first", **kwargs):
         super().__init__()
-        # import pdb
-        # pdb.set_trace()
 
-        print("SwinTransformerSys expand initial----depths:{};depths_decoder:{};drop_path_rate:{};num_classes:{}".format(depths,
-                                                                                                                         depths_decoder,drop_path_rate,num_classes))
+        # print initial configuration
+        print("SwinTransformerSys expand initial----depths:{};depths_decoder:{};drop_path_rate:{};num_classes:{}".format(
+            depths, depths_decoder, drop_path_rate, num_classes))
         # print("EDI 1 WS: {}".format(window_size))
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -700,6 +690,8 @@ class Encode_Decode_Integrator(nn.Module):
         self.img_size = img_size
 
         # split image into non-overlapping patches
+        # import pdb
+        # pdb.set_trace()
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)
@@ -722,11 +714,7 @@ class Encode_Decode_Integrator(nn.Module):
         # print("EDI 2 WS: {}".format(window_size))
         for i_layer in range(self.num_layers):
             layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                               # # Ansh Modify starts
-                               # input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                               input_resolution=(1,
-                               # # Ansh Modify Ends
-                                                 patches_resolution[1] // (2 ** i_layer)),
+                               input_resolution=(1, patches_resolution[1] // (2 ** i_layer)),
                                depth=depths[i_layer],
                                num_heads=num_heads[i_layer],
                                window_size=window_size,
@@ -741,55 +729,69 @@ class Encode_Decode_Integrator(nn.Module):
 
         # build decoder layers
         self.layers_up = nn.ModuleList()
-        self.concat_back_dim = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            concat_linear = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
-                                      int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
-            if i_layer == 0:
-                # import pdb
-                # pdb.set_trace()
-                # # Ansh Modify starts
-                # layer_up = PatchExpand(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
-                #                                          patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
-                layer_up = PatchExpand(input_resolution=(1,
-                                                         patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
-                # #Ansh modify Ends
-            else:
-                layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
-                                         # #Ansh Modify starts
-                                         # input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
-                                         input_resolution=(1,
-                                         # Ansh Modify ends
-                                                           patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
-                                         depth=depths[(self.num_layers-1-i_layer)],
-                                         num_heads=num_heads[(self.num_layers-1-i_layer)],
-                                         window_size=window_size,
-                                         mlp_ratio=self.mlp_ratio,
-                                         qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                         drop=drop_rate, attn_drop=attn_drop_rate,
-                                         drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
-                                         norm_layer=norm_layer,
-                                         upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
-                                         use_checkpoint=use_checkpoint)
-            self.layers_up.append(layer_up)
-            self.concat_back_dim.append(concat_linear)
+        # self.concat_back_dim = nn.ModuleList()
+        # for i_layer in range(self.num_layers):
+        #     concat_linear = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
+        #                               int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
+        #     if i_layer == 0:
+        #         # import pdb
+        #         # pdb.set_trace()
+        #         # # Ansh Modify starts
+        #         # layer_up = PatchExpand(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+        #         #                                          patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
+        #         layer_up = PatchExpand(input_resolution=(1,
+        #                                                  patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
+        #         # #Ansh modify Ends
+        #     else:
+        #         layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
+        #                                  # #Ansh Modify starts
+        #                                  # input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+        #                                  input_resolution=(1,
+        #                                  # Ansh Modify ends
+        #                                                    patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
+        #                                  depth=depths[(self.num_layers-1-i_layer)],
+        #                                  num_heads=num_heads[(self.num_layers-1-i_layer)],
+        #                                  window_size=window_size,
+        #                                  mlp_ratio=self.mlp_ratio,
+        #                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
+        #                                  drop=drop_rate, attn_drop=attn_drop_rate,
+        #                                  drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
+        #                                  norm_layer=norm_layer,
+        #                                  upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+        #                                  use_checkpoint=use_checkpoint)
+        #     self.layers_up.append(layer_up)
+        #     self.concat_back_dim.append(concat_linear)
 
-        self.norm = norm_layer(self.num_features)
-        self.norm_up= norm_layer(self.embed_dim)
+        # Define normalization for encoder output
+        self.norm = norm_layer(self.num_features)  # Adjusted to handle final encoder output
+        # Update self.norm_up to match the expected last dimension (21843)
+        self.norm_up = norm_layer(self.num_classes)  # Changed from norm_layer(self.embed_dim) to norm_layer(self.num_classes)
+
+        # Initialize MLP layers for hidden and output
         # import pdb
         # pdb.set_trace()
+        self.hidden_mlp = Mlp(
+            in_features=self.num_features,
+            hidden_features=self.num_features // 2,  # Larger intermediate representation
+            out_features=self.num_features // 2,
+            act_layer=nn.GELU,
+            drop=0.2  # Introduced dropout for regularization
+        )
 
-        if self.final_upsample == "expand_first":
-            print("---final upsample expand_first---")
-            # #Ansh Modify Begins
-            # self.up = FinalPatchExpand_X4(input_resolution=(img_size//patch_size,img_size//patch_size),dim_scale=4,dim=embed_dim)
-            # self.output = nn.Conv2d(in_channels=embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
-            self.up = FinalPatchExpand_X4(input_resolution=(1 ,img_size//patch_size),dim_scale=4,dim=embed_dim)
+        self.output_mlp = Mlp(
+            in_features=self.num_features // 2,
+            hidden_features=self.num_features // 4,
+            out_features=self.num_classes,  # Output corresponding to the number of classes
+            act_layer=nn.GELU,
+            drop=0.2  # Dropout for the output MLP
+        )
 
-            self.output = nn.Linear(embed_dim, 1)
-            # # Ansh Modify Ends
-
-        self.apply(self._init_weights)
+        self.final_mlp = Mlp(
+            in_features=60,  # Adapt to match your model's requirements
+            out_features=4,  # Number of classes
+            act_layer=nn.GELU,
+            drop=0.2  # Dropout for the final MLP
+        )
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -808,8 +810,10 @@ class Encode_Decode_Integrator(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
-    #Encoder and Bottleneck
+    # Encoder and Bottleneck
     def forward_features(self, x):
+        # import pdb
+        # pdb.set_trace()
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -832,10 +836,19 @@ class Encode_Decode_Integrator(nn.Module):
             x = self.layers[layerNo](x)
 
         x = self.norm(x)  # B L C
+        x = self.hidden_mlp(x)
+        x = self.output_mlp(x)
+        # import pdb
+        # pdb.set_trace()
+        B, _, _ = x.shape
+        x = x.view(B, -1)
+        # import pdb
+        # pdb.set_trace()
+        x = self.final_mlp(x)
 
-        return x, x_downsample
+        return x, None
 
-    #Dencoder and Skip connection
+    # Decoder and Skip connection
     def forward_up_features(self, x, x_downsample):
         for inx, layer_up in enumerate(self.layers_up):
             # print ("UUUUUUUPPPPPPPP: {}".format(inx))
@@ -846,10 +859,10 @@ class Encode_Decode_Integrator(nn.Module):
                 # pdb.set_trace()
                 # Ansh Modify starts
                 # x = torch.cat([x,x_downsample[3-inx]],-1)
-                refVec = x_downsample[3-inx]
+                refVec = x_downsample[3 - inx]
                 if refVec[0, :, 0].shape != x[0, :, 0].shape:
-                    refVec = refVec[:, :-1,:]
-                x = torch.cat([x,refVec],-1)
+                    refVec = refVec[:, :-1, :]
+                x = torch.cat([x, refVec], -1)
                 # Ansh modify ends
                 x = self.concat_back_dim[inx](x)
                 x = layer_up(x)
@@ -861,9 +874,9 @@ class Encode_Decode_Integrator(nn.Module):
     def up_x4(self, x):
         H, W = self.patches_resolution
         B, L, C = x.shape
-        assert L == H*W, "input features has wrong size"
+        assert L == H * W, "input features has wrong size"
 
-        if self.final_upsample=="expand_first":
+        if self.final_upsample == "expand_first":
             # import pdb
             # pdb.set_trace()
             x = self.up(x)
@@ -881,12 +894,14 @@ class Encode_Decode_Integrator(nn.Module):
         # print ("IN integrated E-D")
         # import pdb
         # pdb.set_trace()
+        # import pdb
+        # pdb.set_trace()
         x, x_downsample = self.forward_features(x)
         # print ("=" * 50)
         # import pdb
         # pdb.set_trace()
-        x = self.forward_up_features(x,x_downsample)
-        x = self.up_x4(x)
+        # x = self.forward_up_features(x, x_downsample)
+        # x = self.up_x4(x)
 
         return x
 
@@ -899,11 +914,12 @@ class Encode_Decode_Integrator(nn.Module):
         flops += self.num_features * self.num_classes
         return flops
 
-
+# Initialize logger
 logger = logging.getLogger(__name__)
 
+# Define the WaveformReconstructor class
 class WaveformReconstructor(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=4, zero_head=False, vis=False):
         """
         Hello Preethi
         """
@@ -912,30 +928,28 @@ class WaveformReconstructor(nn.Module):
         self.zero_head = zero_head
         self.config = config
 
-        self.swin_unet = Encode_Decode_Integrator(img_size=config.DATA.IMG_SIZE,
-                                                 patch_size=config.MODEL.SWIN.PATCH_SIZE,
-                                                 in_chans=config.MODEL.SWIN.IN_CHANS,
-                                                 num_classes=self.num_classes,
-                                                 embed_dim=config.MODEL.SWIN.EMBED_DIM,
-                                                 depths=config.MODEL.SWIN.DEPTHS,
-                                                 num_heads=config.MODEL.SWIN.NUM_HEADS,
-                                                 window_size=config.MODEL.SWIN.WINDOW_SIZE,
-                                                 mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
-                                                 qkv_bias=config.MODEL.SWIN.QKV_BIAS,
-                                                 qk_scale=config.MODEL.SWIN.QK_SCALE,
-                                                 drop_rate=config.MODEL.DROP_RATE,
-                                                 drop_path_rate=config.MODEL.DROP_PATH_RATE,
-                                                 ape=config.MODEL.SWIN.APE,
-                                                 patch_norm=config.MODEL.SWIN.PATCH_NORM,
-                                                 use_checkpoint=config.TRAIN.USE_CHECKPOINT)
+        self.swin_unet = Encode_Decode_Integrator(
+            img_size=config.DATA.IMG_SIZE,
+            patch_size=config.MODEL.SWIN.PATCH_SIZE,
+            in_chans=config.MODEL.SWIN.IN_CHANS,
+            num_classes=self.num_classes,
+            embed_dim=config.MODEL.SWIN.EMBED_DIM,
+            depths=config.MODEL.SWIN.DEPTHS,
+            num_heads=config.MODEL.SWIN.NUM_HEADS,
+            window_size=config.MODEL.SWIN.WINDOW_SIZE,
+            mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
+            qkv_bias=config.MODEL.SWIN.QKV_BIAS,
+            qk_scale=config.MODEL.SWIN.QK_SCALE,
+            drop_rate=config.MODEL.DROP_RATE,
+            drop_path_rate=config.MODEL.DROP_PATH_RATE,
+            ape=config.MODEL.SWIN.APE,
+            patch_norm=config.MODEL.SWIN.PATCH_NORM,
+            use_checkpoint=config.TRAIN.USE_CHECKPOINT
+        )
 
     def forward(self, x):
-        # print ("IN waveform reconstructor")
-        # #Ansh Modify begins
-        # if x.size()[1] == 1:
-        #     x = x.repeat(1,3,1,1)
-        # #Ansh Modify Ends
-
+        # import pdb
+        # pdb.set_trace()
         logits = self.swin_unet(x)
         return logits
 
@@ -945,30 +959,30 @@ class WaveformReconstructor(nn.Module):
             print("pretrained_path:{}".format(pretrained_path))
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             pretrained_dict = torch.load(pretrained_path, map_location=device)
-            if "model"  not in pretrained_dict:
-                print("---start load pretrained modle by splitting---")
-                pretrained_dict = {k[17:]:v for k,v in pretrained_dict.items()}
+            if "model" not in pretrained_dict:
+                print("---start load pretrained model by splitting---")
+                pretrained_dict = {k[17:]: v for k, v in pretrained_dict.items()}
                 for k in list(pretrained_dict.keys()):
                     if "output" in k:
                         print("delete key:{}".format(k))
                         del pretrained_dict[k]
-                msg = self.swin_unet.load_state_dict(pretrained_dict,strict=False)
+                msg = self.swin_unet.load_state_dict(pretrained_dict, strict=False)
                 # print(msg)
                 return
             pretrained_dict = pretrained_dict['model']
-            print("---start load pretrained modle of swin encoder---")
+            print("---start load pretrained model of swin encoder---")
 
             model_dict = self.swin_unet.state_dict()
             full_dict = copy.deepcopy(pretrained_dict)
             for k, v in pretrained_dict.items():
                 if "layers." in k:
-                    current_layer_num = 3-int(k[7:8])
+                    current_layer_num = 3 - int(k[7:8])
                     current_k = "layers_up." + str(current_layer_num) + k[8:]
-                    full_dict.update({current_k:v})
+                    full_dict.update({current_k: v})
             for k in list(full_dict.keys()):
                 if k in model_dict:
                     if full_dict[k].shape != model_dict[k].shape:
-                        print("delete:{};shape pretrain:{};shape model:{}".format(k,v.shape,model_dict[k].shape))
+                        print("delete:{};shape pretrain:{};shape model:{}".format(k, v.shape, model_dict[k].shape))
                         del full_dict[k]
 
             msg = self.swin_unet.load_state_dict(full_dict, strict=False)

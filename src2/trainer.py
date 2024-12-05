@@ -1,34 +1,38 @@
+import csv
 import os
+import pandas as pd
 import sys
 import time
 import logging
+import random
 import argparse
 import torch
 import numpy as np
-
 from tqdm import tqdm
-import robust_loss_pytorch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
-from torch.nn.modules.loss import CrossEntropyLoss, MSELoss
-
-from customDataset import SeismicDataset
+from torch.nn.modules.loss import MultiLabelSoftMarginLoss
+import pywt
+from robust_loss_pytorch import AdaptiveLossFunction
+import re
+import wfdb
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from collections import Counter
 from defaultConfig import get_config
 from model import WaveformReconstructor
 import torch.nn as nn
+from robust_loss_pytorch import AdaptiveLossFunction
+from torch.utils.data import WeightedRandomSampler
 
-
+# Constants
 BATCH_SIZE = 4
-nn.CrossEntropyLoss
-NUM_WORKERS = 2
-DATAPATH = r"C:\Users\anshu\JupyterNotebooks\Seismic-Inpainting\dataset"
+NUM_WORKERS = 0
+DATAPATH = "E:\Work\\Classes\Sem3\\IntSys\WFC\waveformReconstructor\src2\\"
 assert os.path.exists(DATAPATH), "Dataset path invalid: {}".format(DATAPATH)
 
+# Setup logger
 def setupLogger():
-    """
-        Logger setup
-    """
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", '%m-%d-%Y %H:%M:%S')
@@ -38,255 +42,269 @@ def setupLogger():
     logger.addHandler(stdout)
     logging.debug("Setting up logger completed")
 
+# Argument loader
 def loadArguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root_path', type=str,
-                        default='../data/Synapse/train_npz', help='root dir for data')
-    parser.add_argument('--dataset', type=str,
-                        default='Synapse', help='experiment_name')
-    parser.add_argument('--list_dir', type=str,
-                        default='./lists/lists_Synapse', help='list dir')
-    parser.add_argument('--num_classes', type=int,
-                        default=9, help='output channel of network')
-    parser.add_argument('--output_dir', type=str, help='output dir')
-    parser.add_argument('--max_iterations', type=int,
-                        default=30000, help='maximum epoch number to train')
-    parser.add_argument('--max_epochs', type=int,
-                        default=150, help='maximum epoch number to train')
-    parser.add_argument('--batch_size', type=int,
-                        default=24, help='batch_size per gpu')
-    parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
-    parser.add_argument('--deterministic', type=int,  default=1,
-                        help='whether use deterministic training')
-    parser.add_argument('--base_lr', type=float,  default=0.01,
-                        help='segmentation network learning rate')
-    parser.add_argument('--img_size', type=int,
-                        default=224, help='input patch size of network input')
-    parser.add_argument('--seed', type=int,
-                        default=1234, help='random seed')
-    parser.add_argument('--cfg', type=str, required=True, metavar="FILE", help='path to config file', )
-    parser.add_argument('--lossName', default="mse", choices=["mse", "adaptive"], help='LossName')
-    parser.add_argument(
-        "--opts",
-        help="Modify config options by adding 'KEY VALUE' pairs. ",
-        default=None,
-        nargs='+',
-    )
-    parser.add_argument('--zip', action='store_true', help='use zipped dataset instead of folder dataset')
-    parser.add_argument('--cache-mode', type=str, default='part', choices=['no', 'full', 'part'],
-                        help='no: no cache, '
-                             'full: cache all data, '
-                             'part: sharding the dataset into nonoverlapping pieces and only cache one piece')
-    parser.add_argument('--resume', help='resume from checkpoint')
-    parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
-    parser.add_argument('--use-checkpoint', action='store_true',
-                        help="whether to use gradient checkpointing to save memory")
-    parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
-                        help='mixed precision opt level, if O0, no amp is used')
-    parser.add_argument('--tag', help='tag of experiment')
+    parser.add_argument('--max_epochs', type=int, default=100, help='maximum epoch number to train')
+    parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
+    parser.add_argument('--base_lr', type=float, default=0.01, help='learning rate')
+    parser.add_argument('--lossName', default="MultiLabelSoftMarginLoss", choices=["MultiLabelSoftMarginLoss", "adaptive"], help='Loss function name')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    parser.add_argument('--throughput', action='store_true', help='Test throughput only')
+    return parser.parse_args()
 
-    allArgs = parser.parse_args()
-    return allArgs
+# Signal denoising function
+def denoise_signal(data, wavelet='sym4', threshold=0.04):
+    w = pywt.Wavelet(wavelet)
+    max_level = pywt.dwt_max_level(len(data), w.dec_len)
+    coeffs = pywt.wavedec(data, wavelet, level=max_level)
+    
+    for i in range(1, len(coeffs)):
+        coeffs[i] = pywt.threshold(coeffs[i], threshold * max(coeffs[i]))
+    
+    denoised_data = pywt.waverec(coeffs, wavelet)
+    return denoised_data
+
+# Dataset class for arrhythmia data
+
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 
-def plotASample(img, label, op, idx, scaleFactor=1.0):
-    import copy
-    from matplotlib import pyplot as plt
-    orig = label['original'][idx]
-    gap = img[idx][0][0]
-    recons = op[idx]
+class ArrhythmiaDataset(Dataset):
+    def __init__(self, npz_folder=".", window_size=9600):
+        """
+        Initialize the dataset with preprocessed .npz files.
+        :param npz_folder: Path to the folder containing .npz files. Defaults to the current directory.
+        :param window_size: Fixed size of the signal window (default: 9600).
+        """
+        self.window_size = window_size
+        self.label_map = {"N": 0, "L": 1, "R": 2, "V": 3}
+        self.npz_folder = os.path.abspath(npz_folder)  # Convert to absolute path
+        self.npz_files = [os.path.join(self.npz_folder, f) for f in os.listdir(self.npz_folder) if f.endswith('.npz')]
+        # import pdb
+        # pdb.set_trace()
+        # Check if .npz files exist
+        if not self.npz_files:
+            raise FileNotFoundError(f"No .npz files found in the directory: {self.npz_folder}")
 
-    # bumpUpTest = min(recons)
-    # if bumpUpTest < 0:
-    #     recons = recons + abs(bumpUpTest)
-    # bumpUpRef = min(orig)
-    # tempRef = copy.deepcopy(orig)
-    # if bumpUpRef < 0:
-    #     tempRef = tempRef + abs(bumpUpRef)
-    # scaleFactor = tempRef.mean() / recons.mean()
-    #
-    # recons = recons - abs(bumpUpTest)
-    recons = recons * float(scaleFactor)
+        self.data = []  # Will store all (signal_channel_1, signal_channel_2, label) tuples
+        self.load_data()
+        random.shuffle(self.data)
 
-    final = copy.deepcopy(orig)
-    final[label['gapStartIdx'][idx] : label['gapEndIdx'][idx]] = recons[label['gapStartIdx'][idx] : label['gapEndIdx'][idx]]
-    final = final.detach()
+        # Check if dataset has been populated
+        if len(self.data) == 0:
+            raise ValueError(f"No data loaded from .npz files in {self.npz_folder}. Ensure files are not empty or corrupted.")
 
-    pStart = label['gapStartIdx'][idx] - 400
-    pEnd = label['gapEndIdx'][idx] + 400
-    fig, ax = plt.subplots(3)
-    ax[0].plot(orig[pStart:pEnd])
-    ax[1].plot(gap.cpu()[pStart:pEnd])
-    ax[2].plot(final.cpu()[pStart:pEnd])
-    plt.savefig("result{}.png".format(idx))
+    def load_data(self):
+        """
+        Load all signal segments and labels from the .npz files during initialization.
+        """
 
-def getLoss(lossName="mse"):
-    assert lossName in ["mse", "adaptive"]
-    if lossName == "mse":
-        return MSELoss()
-    if lossName == "adaptive":
-        return robust_loss_pytorch.adaptive.AdaptiveLossFunction(num_dims = 14400,
-                                                                          float_dtype = np.float32,
-                                                                          device=0)
-    raise Exception("INVALID SOFTWARE FLOW")
+        for npz_file in self.npz_files:
+            # baseFileName = os.path.basename(npz_file)
+            match = re.search("data_(?P<labelName>\w)\.npz", npz_file)
+            assert match, "match not found"
+            label = self.label_map[match.group("labelName")]
+            npz_data = np.load(npz_file, allow_pickle=True)
 
-def computeLoss(lossObj, test, ref):
+            for idx in range(5500):
+                key = "arr_{}".format(idx)
+                if key in npz_data:
+                    try:
+                        npz_data[key].reshape(2,9600)
+                    except:
+                        pass
+                    self.data.append([npz_data[key], label])
+
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset.
+        """
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        """
+        Returns a single sample (signals and label) at the given index.
+        :param idx: Index of the sample.
+        :return: A tuple (signal_tensor, label_tensor).
+        """
+        signal, label = self.data[idx]
+        
+        # Convert signals to PyTorch tensors
+        signal_tensor = torch.tensor(signal, dtype=torch.float32)
+        signal_tensor = (signal_tensor - signal_tensor.min()) / (signal_tensor.max() - signal_tensor.min())
+
+            # Convert label to a PyTorch tensor
+        label_tensor = torch.tensor(label, dtype=torch.float32)
+        try:
+            signal_tensor.reshape(2,1,9600)
+        except:
+            # import pdb
+            # pdb.set_trace()
+            pad = torch.zeros(2, 1)
+            signal_tensor = torch.cat((signal_tensor, pad), dim=1)
+        return signal_tensor.reshape(2,1,9600), label_tensor
+    
+def getloss(op, label, num_classes=4, reduction='mean'):
     """
-    Biased loss 0.67 Normal + 0.33 biased for gap boundaries
-    """
-    # normalLoss = lossObj(test, ref['original'].cuda().float())
-    # B, _ = test.shape
-    # refList = []
-    # testList = []
-    # for i in range(B):
-    #     refVal = ref['original'][i][ref['gapStartIdx'][i] : ref['gapStartIdx'][i] + 1]
-    #     testVal = test[i][ref['gapStartIdx'][i] : ref['gapStartIdx'][i] + 1]
-    #     refList.append(refVal)
-    #     testList.append(testVal)
-    # finalRef = torch.stack(refList)
-    # finalTest = torch.stack(testList)
-    # boundaryLoss = lossObj(finalTest, finalRef.cuda().float())
-    # loss = 0.67 * normalLoss + 0.33 * boundaryLoss
-    # return loss
+    Compute the MultiLabelSoftMarginLoss for multi-class classification.
 
-    # normalLoss = lossObj(test, ref['original'].cuda().float())
-    B, _ = test.shape
-    refList = []
-    testList = []
-    for i in range(B):
-        refVal = ref['original'][i][ref['gapStartIdx'][i] : ref['gapEndIdx'][i]]
-        testVal = test[i][ref['gapStartIdx'][i] : ref['gapEndIdx'][i]]
-        refList.append(refVal)
-        testList.append(testVal)
-    finalRef = torch.stack(refList)
-    finalTest = torch.stack(testList)
-    loss = lossObj(finalTest, finalRef.cuda().float())
+    :param op: Model output (logits), shape [batch_size, num_classes].
+    :param label: Target labels, scalar [batch_size] or one-hot encoded [batch_size, num_classes].
+    :param num_classes: Number of classes (default = 4).
+    :param reduction: Specifies the reduction to apply: 'none' | 'mean' | 'sum'.
+    :return: Scalar loss value.
+    """
+    loss_fn = nn.MultiLabelSoftMarginLoss(reduction=reduction)
+
+    # Handle scalar labels (convert to multi-hot encoding)
+    if label.dim() == 1:
+        batch_size = label.size(0)
+        # Create a multi-hot label tensor
+        multi_hot_label = torch.zeros((batch_size, num_classes), device=label.device)
+        multi_hot_label.scatter_(1, label.unsqueeze(1).long(), 1)
+        label = multi_hot_label
+
+    # Handle already one-hot encoded labels
+    elif label.dim() == 2:
+        label = label.float()
+
+    else:
+        raise ValueError(f"Unexpected label dimensions: {label.dim()}. Expected 1 or 2.")
+
+    # Ensure logits (op) are float
+    op = op.float()
+
+    # Check for shape mismatches
+    if op.shape != label.shape:
+        raise ValueError(f"Shape mismatch: op shape {op.shape}, label shape {label.shape}")
+
+    # Compute loss
+    loss = loss_fn(op, label)
     return loss
 
+
+# Main training script
 if __name__ == "__main__":
-    # setup logger
     setupLogger()
-    # Load arguments
     allArgs = loadArguments()
-    import pdb
-    pdb.set_trace()
-    print("HOOK")
-    config = get_config(allArgs)
-    print("MAIN WS: {}".format(config.MODEL.SWIN.WINDOW_SIZE))
-    model = WaveformReconstructor(config, img_size=allArgs.img_size, num_classes=allArgs.num_classes).cuda()
-    model.load_from(config)
+    
+    # Create a namespace with all the expected attributes for get_config
+    args = argparse.Namespace(
+        cfg="modifyConfig.yaml",
+        opts=[],
+        batch_size=allArgs.batch_size,
+        max_epochs=allArgs.max_epochs,
+        base_lr=allArgs.base_lr,
+        zip=False,
+        cache_mode='part',
+        resume='',
+        accumulation_steps=1,
+        use_checkpoint=False,
+        amp_opt_level='O1',
+        tag='experiment',
+        eval=allArgs.eval,
+        throughput=False,
+        pretrained=False,
+        output='',
+        local_rank=0,
+        seed=42,
+        print_freq=10,
+        save_ckpt_freq=10
+    )
+    
+    config = get_config(args)
 
-    trainContainer = SeismicDataset(DATAPATH, gap_len=60, augment=True, dataType="train")
-    testContainer = SeismicDataset(DATAPATH, gap_len=60, augment=False, dataType="test")
-    trainGenerator = DataLoader(trainContainer,
-                                batch_size=BATCH_SIZE,
-                                shuffle=True,
-                                num_workers=NUM_WORKERS)
-    testGenerator = DataLoader(testContainer,
-                               batch_size=BATCH_SIZE,
-                               shuffle=True,
-                               num_workers=NUM_WORKERS)
+    model = WaveformReconstructor(config).cuda()
+   
+    # Create Dataset containers
+    trainContainer = ArrhythmiaDataset(DATAPATH, window_size=9600)
+    testContainer = ArrhythmiaDataset(DATAPATH, window_size=9600)
 
-    # Training
+    # Option 1: Use a weighted sampler
+    trainGenerator = DataLoader(trainContainer, batch_size=allArgs.batch_size, num_workers=NUM_WORKERS)
+
+    # Option 2: Oversample the dataset (comment out if using the sampler)
+    # oversampled_data = trainContainer.oversample_dataset(trainContainer, train_class_counts)
+    # trainGenerator = DataLoader(oversampled_data, batch_size=allArgs.batch_size, shuffle=True, num_workers=NUM_WORKERS)
+
+    # Test DataLoader
+    testGenerator = DataLoader(testContainer, batch_size=allArgs.batch_size, shuffle=False, num_workers=NUM_WORKERS)
+#    model.load_state_dict(torch.load("bestModel.pt"))
     model.train()
-    lossObj = getLoss(lossName=allArgs.lossName)
-    base_lr = allArgs.base_lr
-    # dice_loss = DiceLoss(num_classes)
-    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.0001)
-    # writer = SummaryWriter(snapshot_path + '/log')
-    iter_num = 0
+   # lossObj = getloss()
+    optimizer = optim.AdamW(model.parameters(), lr=allArgs.base_lr, weight_decay=0.01)
     max_epoch = allArgs.max_epochs
-    max_iterations = allArgs.max_epochs * len(trainGenerator)
-    # iterator = tqdm(range(max_epoch), ncols=70)
     lossVecE = []
-    import pdb
-    pdb.set_trace()
-    for epochNum in range(max_epoch):
-        eStart = time.time()
-        lossVecB = []
-        for batchIdx, batchData in enumerate(trainGenerator):
-            if os.path.exists("pauseTraining.txt"):
-                os.remove("pauseTraining.txt")
-                import pdb
-                pdb.set_trace()
-            startTime = time.time()
-            img, label = batchData
-            img = img.cuda()
-            img = img.float()
-            op = model(img)
-            # print("HOOK")
-            import pdb
-            pdb.set_trace()
-            loss = computeLoss(lossObj, op, label)
 
-            # loss = processLoss()
-            lossVecB.append(loss.mean())
+best_accuracy = 0  # Initialize the best accuracy
+best_epoch = -1  # Initialize the best epoch number
+
+# Training Loop
+best_accuracy = 0  # Initialize the best accuracy
+best_epoch = -1  # Initialize the best epoch number
+
+for epochNum in range(max_epoch):
+    eStart = time.time()
+    lossVecB = []  # To store batch losses
+    correct = 0    # To count correct predictions
+    total = 0      # To count total labels processed
+
+    print(f"Starting Epoch {epochNum + 1}...")
+
+    for batchIdx, (img, label) in enumerate(trainGenerator):
+        try:
+            # Move data to GPU
+            img, label = img.cuda().float(), label.cuda()
+
+            # Forward pass
+            op = model(img)
+
+            # Compute predictions
+            predictions = (torch.sigmoid(op) > 0.5).float()
+
+            # Compute loss
+            loss = getloss(op, label)
+            lossVecB.append(loss.item())
+
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
-            endTime = time.time()
-            # print("Batch Time: {}".format(endTime - startTime))
-            # lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
-            # for param_group in optimizer.param_groups:
-            #     param_group['lr'] = lr_
-        eEnd = time.time()
-        lossEMean = sum(lossVecB) / float(len(lossVecB))
-        print("Epoch Time {}: {} [Loss: {}]".format(epochNum + 1, eEnd - eStart, lossEMean))
-        lossVecE.append(lossEMean)
-        torch.save(model.state_dict(), "trainedModel.pt")
-    import pdb
-    pdb.set_trace()
-    print("HOOK")
-
-    torch.save(model.state_dict(), "trainedModel.pt")
-    print("HOOK 2")
-
-"""
-(Pdb) orig = label['sample'][0] 
-(Pdb) orig.shape
-torch.Size([7200])
-(Pdb) gap = img[0][0][0] 
-(Pdb) gap.shape
-torch.Size([7200])
-(Pdb) recons = op[0] 
-(Pdb) recons.shape
-torch.Size([7200])
-(Pdb) max(recons) 
-tensor(0.0092, device='cuda:0', grad_fn=<UnbindBackward0>)
-(Pdb) min(recons) 
-tensor(-0.0081, device='cuda:0', grad_fn=<UnbindBackward0>)
-(Pdb) max(orig) 
-tensor(0.8456)
-(Pdb) min(orig) 
-tensor(-1.)
-(Pdb) 1/0.0081
-123.4567901234568
-(Pdb) recons + recons * 120.0
-tensor([ 0.3995,  0.5557, -0.0433,  ..., -0.3337,  0.1794,  0.2092],
-       device='cuda:0', grad_fn=<AddBackward0>)
-(Pdb) recons = recons * 120.0 
-(Pdb) import copy
-(Pdb) final = copy.deepcopy(orig) 
-(Pdb) label['gapStartIdx'] 
-tensor([6122, 4326, 6687, 6338])
-(Pdb) label['gapEndIdx']   
-tensor([6152, 4356, 6717, 6368])
-(Pdb) final[6122:6152] = recons[6122:6152] 
-(Pdb) from matplotlib import pyplot as plt
-(Pdb) fig, ax = plt.subplots(3) 
-(Pdb) ax[0].plot(orig[5500:6500]) 
-[<matplotlib.lines.Line2D object at 0x000001867705BE80>]
-(Pdb) ax[1].plot(gap.cpu()[5500:6500]) 
-[<matplotlib.lines.Line2D object at 0x000001867705BE50>]
-(Pdb) final = final.detach() 
-(Pdb) ax[2].plot(final.cpu()[5500:6500]) 
-[<matplotlib.lines.Line2D object at 0x00000186770710D0>]
-(Pdb) plt.savefig("result.png") 
-
-"""
 
 
+            # Accuracy calculation
+            correct_labels = (predictions == label).sum().item()
+            total_labels = predictions.numel()  # Total number of labels in the batch
+            correct += correct_labels
+            total += total_labels
 
+        except Exception as e:
+            print(f"Error in batch {batchIdx}: {e}")
+            # Debugging: Inspect the problematic batch
+          ##   print(f"Label shape: {label.shape if 'label' in locals() else 'N/A'}")
+            continue  # Skip the problematic batch
+
+    # Calculate epoch metrics
+    eEnd = time.time()
+    lossEMean = sum(lossVecB) / len(lossVecB) if len(lossVecB) > 0 else float('inf')
+    accuracy = (correct / total) * 100 if total > 0 else 0  # Avoid division by zero
+
+    print(f"Epoch {epochNum + 1}: Time = {eEnd - eStart:.2f}s, Loss = {lossEMean:.4f}, Accuracy = {accuracy:.2f}%")
+
+    # Save the model for the current epoch
+    torch.save(model.state_dict(), f"epoch{epochNum}.pt")
+
+    # Update the best model
+    if accuracy > best_accuracy:
+        best_accuracy = accuracy
+        best_epoch = epochNum
+        torch.save(model.state_dict(), "bestModel.pt")  # Save the best model
+
+# After training, print the best accuracy and epoch
+print(f"Training complete. Best Accuracy: {best_accuracy:.2f}% at Epoch {best_epoch + 1}")
 
