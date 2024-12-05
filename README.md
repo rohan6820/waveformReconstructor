@@ -27,4 +27,18 @@ To adapt Xi-Net for ECG classification, the architecture has been reconfigured a
 - **Feature Fusion Strategy**: Time and frequency features are concatenated before passing through dense layers.
 - **MLP Section**: A multilayer perceptron (MLP) with dropout and activation layers refines features to improve classification accuracy.
 
+## Prerequisites
 
+Before running the training or evaluation scripts, you need to preprocess the dataset to generate `.npz` files. Follow these steps:
+
+### Steps to Prepare and Run the Model
+
+1. **Add Dataset Path**:
+   - Download and place the MIT-BIH Arrhythmia dataset in a directory of your choice.
+   - Update the dataset path in the preprocessing code (`DATAPATH`) with the correct directory.
+
+2. **Run Preprocessing**:
+   - Execute the `preprocessing.py` script to generate `.npz` files. These files will be stored in a subfolder named `processed_segments` inside the dataset folder.
+
+   ```bash
+   python preprocessing.py
